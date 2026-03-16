@@ -145,4 +145,3 @@ const ReDate = `(\d{2})[/\-](\d{2})[/\-](\d{4})`
 - Interfaz gráfica o API REST.
 - Exportación a formatos distintos de CSV.
 - Procesamiento de archivos que no sigan el patrón `PlanDePag*.pdf`.
-

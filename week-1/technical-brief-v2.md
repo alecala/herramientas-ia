@@ -1,7 +1,13 @@
-# Technical Brief: PDF Payment Plan Extractor → Microservice
+# Technical Brief Name: PDF Payment Plan Extractor Microservice (V3)
 
-**Version:** 2.0  
-**Language:** Go 1.24 | **Targets:** `darwin/arm64` (primary), `linux/amd64` (CI) | **Architecture:** Hexagonal (Ports & Adapters)
+> **Legend:** Sections marked with `*` are optional. Skip or remove them if not applicable.
+
+| Field   | Value                        |
+|---------|------------------------------|
+| Author  | Alexis Cala                  |
+| Date    | 2026-03-14                   |
+| Version | 3.1                          |
+| Status  | Draft                        |
 
 ---
 
@@ -9,381 +15,360 @@
 
 ### What exists today
 
-A CLI application that:
+A Go CLI tool currently:
 
-1. Scans a configurable directory for files matching the pattern `PlanDePag*.pdf`.
-2. Parses each PDF to extract a structured payment plan table — each file represents a personal credit plan of **up to 72 installments** (`cuotas`), generated at different cut-off dates.
-3. Consolidates all extracted rows into a **single CSV file**, ordered alphabetically by filename then by row position within each file.
-4. Records every failed row or failed file in a structured **failures log**.
-
-Read `technical-brief-v1.md` for the full original specification of the CLI tool.
+1. Scans a configurable directory for files matching `PlanDePag*.pdf`.
+2. Extracts payment-plan rows from each PDF (up to 72 installments per file).
+3. Consolidates all valid rows into one CSV ordered by filename, then row position.
+4. Logs row-level and file-level extraction failures in a structured failures log.
 
 ### What we are building
 
-An HTTP microservice that exposes the same extraction flow via REST endpoints, Transforming CLI into a Hexagonal architecture with API/Service/Infrastructure layers. Where only HTTP would be driving the service core, rate-limited background jobs, structured error envelopes, graceful shutdown.
+A Go 1.24 HTTP microservice (hexagonal architecture) that exposes the same extraction flow via REST endpoints and background jobs, with:
 
-> **Key Principle:** Only the API would expose the business logic. The microservice is an HTTP adapter, not a rewrite.
+- API-driven execution (`POST /read-all`) returning `202 Accepted` quickly.
+- Single active job policy (fast-fail `409` when a job is in progress).
+- In-memory job lifecycle tracking (`accepted`, `running`, `finished`, `failed`).
+- Structured error envelope and correlation IDs.
+- Graceful shutdown with timeout and cancellation.
 
----
-
-## 2. Architecture — Hexagonal (Ports & Adapters)
-
-| Package | Responsibility | Allowed Dependencies |
-|---|---|---|
-| `api` | HTTP handlers, auth middleware, request validation, rate limiting, background job orchestration, error envelope mapping | `service` via interfaces only |
-| `service` | Business use cases: scan for PDFs, parse tables, transform rows, orchestrate CSV persistence. **Zero framework dependencies.** | `infrastructure` via interfaces/ports only |
-| `infrastructure` | Concrete adapters: CSV writer (mutex-protected), PDF extractor, rate limiter, job tracker. Each implements a port defined in `service`. | stdlib + approved third-party libs |
-| `config` | Central config struct, env var + file parsing, startup validation, precedence logic. | stdlib only |
-
-### Interface-Driven Contracts (Ports)
-
-All cross-layer dependencies must go through interfaces. Concrete types must never be imported across layer boundaries. Minimum required ports:
-
-- `PDFExtractor` — implemented by `infrastructure`; used by `service`. Enables mock-based unit testing without real PDF files.
-- `CSVWriter` — implemented by `infrastructure`; used by `service`. Must be mutex-protected for safe concurrent use by CLI and API.
-- `RateLimiter` — implemented by `infrastructure`; used by `api`.
-- `JobTracker` — implemented by `infrastructure`; used by `api` and `service`.
+> **Key Principle:** The business extraction behavior remains the same as v2; HTTP is an adapter over service use cases, not a rewrite of core logic.
 
 ---
 
-## 3. Input: PDF File Discovery
+## 2. Technical Approach
 
-- **Pattern:** Only files matching `PlanDePag*.pdf` are processed. All others are silently ignored.
-- **Source directory:** Configurable via environment `INPUT_DIR`. Default: current working directory (`.`).
-- **Ordering:** Files are processed in **alphabetical order by filename**. Row order in the CSV follows this file order, then row position within each file.
-- **Atomicity:** File processes should the rename to `Done-PlanDePag*.pdf`
-- **Upload:** Each 5 min, a job should scan for new files.
+### * Architecture
 
----
+Hexagonal (Ports & Adapters), with strict interface boundaries:
 
-## 4. Parameter Schema (Authoritative Contract)
+- `api`: HTTP handlers, middleware, payload validation, request size limits, error envelope mapping, rate-limit gate, background orchestration.
+- `service`: framework-agnostic use cases (discover PDFs, parse rows, transform values, orchestrate writer and failure logger).
+- `infrastructure`: concrete adapters (`PDFExtractor`, `CSVWriter`, `RateLimiter`, `JobTracker`).
+- `config`: env-driven configuration loading, defaults, validation, precedence.
 
-This table is the single source of truth the `POST /read-all` JSON request body.
+Port contracts required:
 
-| Field | JSON Key | Type | Required | Default | Constraints |
-|---|---|---|---|---|---|
-| Output CSV path | `output` | string | No | `"output.csv"` | Must end in `.csv`; parent directory must exist |
-| Failures log path | `failures` | string | No | `"failures.log"` | Parent directory must exist |
-| Overwrite if exists | `overwrite` | boolean | No | `false` | If `false` and output file exists → abort with exit code `1` |
-| Worker goroutines | `workers` | integer | No | `NumCPU` | Min: `1`, Max: `16` |
-| Log level | — | string | No | `"info"` | Enum: `debug`, `info`, `warn`, `error`. CLI only; API uses `LOG_LEVEL` env var. |
+- `PDFExtractor` used by `service`, implemented in `infrastructure`.
+- `CSVWriter` used by `service`, implemented in `infrastructure` (must be mutex-protected).
+- `RateLimiter` used by `api`, implemented in `infrastructure`.
+- `JobTracker` used by `api` and `service`, implemented in `infrastructure`.
 
----
+### * Input
 
-## 5. Concurrency: PDF Processing
+#### Parameter Schema
 
-- Multiple PDFs are processed in **parallel** using a worker pool of `N` goroutines, where `N` is defined in a ENV var (`WORKERS_DEFAULT`), but could be overwritten by the workers parameter in the post endpoint.
-- The CSV writer must be **mutex-protected** in the infrastructure adapter to keep writes atomic and safe for concurrent use.
-- The worker pool is managed within the `service` layer; the infrastructure `CSVWriter` adapter handles thread safety transparently.
+Authoritative request schema for `POST $PREFIX_PATH/read-all`:
 
----
+| Field               | JSON Key    | Type    | Required | Default                                    | Constraints                                                                                       |
+|---------------------|-------------|---------|----------|--------------------------------------------|---------------------------------------------------------------------------------------------------|
+| Output CSV path     | `output`    | string  | No       | `CSV_DEFAULT_OUTPUT` (fallback `output.csv`) | Must end with `.csv`; parent dir must exist                                                     |
+| Failures log path   | `failures`  | string  | No       | `failures.log`                             | Parent dir must exist                                                                             |
+| Overwrite if exists | `overwrite` | boolean | No       | `false`                                    | If `false` and output exists, it is checked synchronously before returning `202`; return `409`   |
+| Worker goroutines   | `workers`   | integer | No       | `WORKERS_DEFAULT`                          | Min `1`, Max `16`                                                                                 |
 
-## 6. Output: CSV Specification
+Input/file discovery and scheduling:
 
-### Column Schema
+- Source directory: `INPUT_DIR` (default `.`).
+- Process only files matching `PlanDePag*.pdf`; ignore all others.
+- `INPUT_DIR` must exist at startup; if not, the service must refuse to start with a fatal structured log and non-zero exit code.
+- File discovery takes a snapshot of `INPUT_DIR` at the moment the job transitions to `running`; files added or renamed after that snapshot are not included in the current job.
+- Process files in alphabetical order.
+- Row ordering in CSV: file order (alphabetical) then row order within file. Workers process files concurrently but results are merged into a pre-allocated slot-indexed structure keyed by file position, guaranteeing deterministic output order regardless of which worker finishes first.
+- Background scan cadence: every 5 minutes. The scanner checks for files matching `PlanDePag*.pdf` in `INPUT_DIR`; if at least one is found and no job is active, it enqueues a new job using env-var defaults (`CSV_DEFAULT_OUTPUT`, `WORKERS_DEFAULT`, `overwrite=false`). The auto-enqueued job is tracked identically to a manually submitted job; its `job_id` is logged at `INFO` level. No HTTP response is produced.
 
-All columns must appear in this **exact order**:
+Input sanitization and limits:
 
-| Column | Type | Rules |
-|---|---|---|
-| `Filename` | string | PDF filename only — no path. RFC 4180 quoting if value contains a comma or double quote. |
-| `Fecha Fin` | string | Normalized to `YYYY-MM-DD`. Source may be `DD/MM/YYYY` or `DD-MM-YYYY`. |
-| `Capital` | decimal | Required. See numeric format rules below. |
-| `Interes Corriente` | decimal | Required. See numeric format rules below. |
-| `Interes Mora` | decimal | Default `0.00` if absent or empty in the PDF. |
-| `Seguros/FNG` | decimal | Required. See numeric format rules below. |
-| `Otros Conceptos` | decimal | Default `0.00` if absent or empty in the PDF. |
-| `Total Exigible` | decimal | Required. See numeric format rules below. |
-| `Total Pagado` | decimal | Required. See numeric format rules below. |
-| `Estado` | string | Raw value as it appears in the PDF. Expected values: `Pagada`, `Pendiente`, `Vencida`, `Condonada`. If an unexpected value is found, it must be accepted and **documented in the README**. |
-| `Pendiente por Pagar` | decimal | Required. See numeric format rules below. |
-| `Condonado` | decimal | See numeric format rules below. |
-| `Saldo de Capital` | decimal | Required. See numeric format rules below. |
+- Reject `INPUT_DIR` traversal patterns like `..`.
+- Validate `workers` range `[1,16]`.
+- Enforce strict JSON boolean for `overwrite` (string `"true"` is rejected).
+- Enforce `Content-Type: application/json` on `POST /read-all`; reject with `415 Unsupported Media Type` and `{"code":"unsupported_media_type","message":"Content-Type must be application/json","correlation_id":"<uuidv4>"}` if absent or different.
+- Request body max size: 2KB. Requests exceeding this limit must be rejected with `413 Request Entity Too Large` and `{"code":"request_too_large","message":"Request body exceeds 2KB limit","correlation_id":"<uuidv4>"}`.
 
-### Numeric Format Rules
+### * Output
 
-All decimal values in the CSV must follow these transformation rules:
+CSV output requirements:
 
-| Rule | Example input (from PDF) | Example output (CSV) |
-|---|---|---|
-| Remove currency symbol | `$ 1.234,56` | `1234.56` |
-| Remove thousands separator | `1.234.567` | `1234567` |
-| Replace comma decimal separator with dot | `1.234,56` | `1234.56` |
-| Preserve negative sign | `-$ 150,00` | `-150.00` |
-| Always 2 decimal places | `100` | `100.00` |
+- UTF-8 without BOM.
+- Delimiter `,`.
+- RFC 4180 quoting for fields with comma or quotes.
+- Default output file: `CSV_DEFAULT_OUTPUT` (default `output.csv`).
+- If output exists and `overwrite=false`, return `409 duplicated_file` (checked synchronously before returning `202`).
+- If output exists and `overwrite=true`, replace it atomically (write to a temp file, then rename).
 
-Format string: `%.2f`
+#### Temp Artifacts
 
-### Date Format Rules
+A temp artifact is any file written by the service that is not the final committed output:
 
-- Accepted source formats: `DD/MM/YYYY` and `DD-MM-YYYY`.
-- Output format: `YYYY-MM-DD`.
-- If the date does not match either pattern → the row is a **failure** (see Section 8).
+- The in-progress partial CSV written during extraction (e.g. `output.csv.tmp`).
+- The in-progress partial failures log written during extraction (e.g. `failures.log.tmp`).
 
-### File Encoding & Format
+Cleanup rules:
 
-- Encoding: **UTF-8 without BOM**.
-- Delimiter: **comma** (`,`).
-- Fields containing commas or double quotes: **wrapped in double quotes** per RFC 4180.
-- Overwrite behavior: controlled by the `overwrite` parameter. If `false` and the output file already exists → abort immediately with exit code `1`.
+| Event | Action |
+|-------|--------|
+| Job finishes successfully | Rename `.tmp` files to final names; delete any leftover `.tmp` from previous runs. |
+| Job fails, panics, or times out | Delete all `.tmp` files produced by that job. Final output file is not written. |
+| Graceful shutdown during active job | Cancel job, delete `.tmp` files, log partial state at `WARN`. |
+| Startup | Sweep and delete any `.tmp` files left from a previous crashed process. |
 
----
+The final committed `output.csv` is never deleted by the service under any circumstance; only `.tmp` intermediates are cleaned.
 
-## 7. PDF Library
+CSV columns in exact order:
 
-Use `ledongthuc/pdfreader`. **The chosen library must be justified in the README** with rationale covering: text extraction fidelity, table detection approach, maintenance status, and license. This decision is left to the implementer but must be documented before the first PR is merged.
+1. `Filename`
+2. `Fecha Fin`
+3. `Capital`
+4. `Interes Corriente`
+5. `Interes Mora`
+6. `Seguros/FNG`
+7. `Otros Conceptos`
+8. `Total Exigible`
+9. `Total Pagado`
+10. `Estado`
+11. `Pendiente por Pagar`
+12. `Condonado`
+13. `Saldo de Capital`
 
----
+Column and transformation rules:
 
-## 8. Failures Log Specification
+- `Fecha Fin`: accept `DD/MM/YYYY` or `DD-MM-YYYY`; store `YYYY-MM-DD`.
+- Required numeric fields: `Capital`, `Interes Corriente`, `Seguros/FNG`, `Total Exigible`, `Total Pagado`, `Pendiente por Pagar`, `Saldo de Capital`.
+- Default `0.00` when empty/missing: `Interes Mora`, `Otros Conceptos`, `Condonado`.
+- Numeric normalization:
+  - Remove currency symbols/spaces.
+  - Remove thousands separator `.`.
+  - Convert decimal separator `,` to `.`.
+  - Preserve negative sign.
+  - Always output with `%.2f`.
+- `Estado` cannot be empty; expected values include `Pagada`, `Pendiente`, `Vencida`, `Condonada`; unknown but non-empty values are accepted and documented.
 
-### Row-Level Failure Conditions (`ROW_ERROR`)
+Post-processing requirement:
 
-A row is invalid and must be **omitted from the CSV** if any of the following are true:
+- After a file's rows are successfully extracted and written, that source file must be renamed from `PlanDePag*.pdf` to `Done-PlanDePag*.pdf`.
+- If `os.Rename` fails (e.g. permissions error, cross-device link), the failure is logged as a `FILE_ERROR` with `Reason=rename failed: <os error>`. The rows already written to the CSV remain in the output; the file is not re-processed in the same job. The job continues processing remaining files and finishes normally unless all files fail.
 
-1. Any required numeric field (`Capital`, `Interes Corriente`, `Seguros/FNG`, `Total Exigible`, `Total Pagado`, `Pendiente por Pagar`, `Saldo de Capital`) is not parseable as a number.
-2. `Fecha Fin` does not match `DD/MM/YYYY` or `DD-MM-YYYY`.
-3. `Estado` is empty.
-4. The number of columns extracted from the row does not match the expected schema.
+### * Log Specification
 
-### File-Level Failure Conditions (`FILE_ERROR`)
+#### Structured Logging
 
-A file is considered completely failed if:
+- Use `log/slog` with configurable `LOG_LEVEL` (`debug`, `info`, `warn`, `error`).
+- Every log entry must carry: `correlation_id`, `layer` (`api`/`service`/`infra`), level.
+- Security events: `WARN`.
+- Job state transitions: `INFO`.
+- Cleanup events: `DEBUG`.
+- Startup validation failures: `ERROR` to stderr, then `os.Exit(1)`.
 
-- It cannot be opened or read.
-- No table matching the expected pattern is found within the file.
-- Every row in the file fails individually.
-
-### Log Entry Format
+#### Failures Log Entry Format
 
 ```
 [TIMESTAMP] [LEVEL] Filename=<n> Row=<number|N/A> Reason=<specific description> RawContent=<raw extracted text, truncated to 200 chars>
 ```
 
-- `TIMESTAMP`: RFC3339 format — `2006-01-02T15:04:05Z07:00`
-- `LEVEL`: `ROW_ERROR` for individual row failures | `FILE_ERROR` for complete file failures
-- `Reason` must be **specific**, not generic. e.g., `"Capital field '1.234' not parseable: missing decimal"` not `"parse error"`.
-- `RawContent`: the raw text extracted from the row before any parsing attempt, truncated to 200 characters.
+- `TIMESTAMP`: RFC3339 (`2006-01-02T15:04:05Z07:00`).
+- `LEVEL`: `ROW_ERROR` for row failures, `FILE_ERROR` for complete file failures.
+- `Reason` must be specific and actionable.
+- `RawContent` must be truncated to 200 chars.
 
----
+Row-level failure conditions (`ROW_ERROR`):
 
-## 9. Regex Constants
+- Required numeric field is not parseable.
+- Date is not in allowed formats.
+- `Estado` is empty.
+- Extracted column count does not match expected schema.
 
-All regular expressions must be defined as **named constants** in a single `config.go` or `regex.go` file. They must **not** appear inline anywhere in business logic. Each constant requires an explanatory comment.
+File-level failure conditions (`FILE_ERROR`):
+
+- File cannot be opened/read.
+- Expected table pattern not found.
+- All rows in file fail.
+- Rename to `Done-PlanDePag*.pdf` fails after successful extraction.
+
+### * Libraries & Dependencies
+
+- PDF extraction library: `ledongthuc/pdfreader`.
+- Rationale (must be documented in README before first PR merge):
+  - Extraction fidelity with payment plan table text.
+  - Table-detection strategy compatibility.
+  - Maintenance status/activity.
+  - License compatibility.
+- External libraries are allowed only when required for service operation and must satisfy security and maintainability criteria.
+
+Regex standard:
+
+- All regex constants live in a single config file (for example `internal/config/regex.go`).
+- No inline regex in business logic.
+- Every regex constant must include explanatory comments.
+
+Example:
 
 ```go
-// ReNumeric matches currency values with optional symbol, thousands sep and comma decimal
-// e.g. "$ 1.234,56" or "1.234.567,00"
+// ReNumeric matches currency values with optional symbol, thousands sep and comma decimal.
 const ReNumeric = `\$?\s*([\d\.]+),([\d]{2})`
 
-// ReDate matches dates in DD/MM/YYYY or DD-MM-YYYY format
+// ReDate matches dates in DD/MM/YYYY or DD-MM-YYYY format.
 const ReDate = `(\d{2})[/\-](\d{2})[/\-](\d{4})`
 ```
 
----
+### * API Definition
 
-## 10. HTTP API
+#### Endpoint Table
 
-### Prefix Path
+Assume route prefix from `PREFIX_PATH` (default `/api/pdf-converter`) is applied before registration.
 
-Configurable via `PREFIX_PATH` env var. Default: `/api/pdf-converter`. Must be applied before any route is registered.
+| Method | Path                                | Rate Limit            | Auth Required | Description                                                         |
+|--------|-------------------------------------|-----------------------|---------------|---------------------------------------------------------------------|
+| POST   | `$PREFIX_PATH/read-all`             | 1 active job globally | No            | Validates payload, enqueues background processing, returns `job_id` |
+| GET    | `$PREFIX_PATH/jobs/{job_id}/status` | None                  | No            | Returns job state (`accepted/running/finished/failed`)              |
 
-### Endpoints
+> **Auth note:** Authentication is fully out of scope for V3. All endpoints are unauthenticated. Bearer-token and RBAC are deferred to a future version.
 
-| Method | Path                                     | Auth Required | Description                                                                                                                                            |
-|---|------------------------------------------|---------------|--------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `POST` | `$PREFIX_PATH/read-all`                  | No            | Validate payload, enqueue job, return `202` within ≤3s. Processing continues in background. Back to be available when finishes. Should return an JOBID |
-| `GET` | `$PREFIX_PATH/health`                    | No            | Liveness probe. Returns `{"status":"ok"}` plus optional build metadata.                                                                                |
-| `GET` | `$PREFIX_PATH/readyNoReadiness/{job_id}` | No |  probe. 200 if service is ready to accept new jobs (no job in progress); 503 if a job is currently running. |
+#### Identity: `job_id` and `correlation_id`
 
-### Response Contract
+The `job_id` returned in the `202` response body and the `correlation_id` propagated through logs and error envelopes are **the same UUIDv4**, generated once at acceptance time. All log entries and error envelopes for a given job must carry this single identifier under the `correlation_id` key; the HTTP response surfaces it as `job_id` for client-facing clarity.
 
-| Scenario                   | HTTP Status                 | Response Body                                                                                                                           |
-|----------------------------|-----------------------------|-----------------------------------------------------------------------------------------------------------------------------------------|
-| Job accepted               | `202 Accepted`              | `{"correlation_id":"<uuidv4>","status":"accepted","message":"Job enqueued, processing in background"}`                                  |
-| Job already running        | `409 Conflict`              | `{"code":"rate_limit","message":"A job is already in progress","correlation_id":"<id>","hint":"Retry after the current job completes"}` |
-| Job finished               | `200 OK`                     | `{"status":"ready", "job_id": <job_id>}`                                                                                                |
-| Validation failure         | `400 Bad Request`           | `{"code":"validation","message":"<field-level detail>","correlation_id":"<id>"}`                                                        |
-| Missing / invalid token    | `401 Unauthorized`          | `{"code":"auth","message":"Missing or invalid bearer token","correlation_id":"<id>"}`                                                   |
-| Valid token, no permission | `403 Forbidden`             | `{"code":"auth","message":"Caller not authorized","correlation_id":"<id>","hint":"<auditable reason>"}`                                 |
-| Unexpected error           | `500 Internal Server Error` | `{"code":"internal","message":"Unexpected error","correlation_id":"<id>"}`                                                              |
-| Service idle (readiness)   | `200 OK`                    | `{"status":"ready"}`                                                                                                                    |
-| Job in-flight (readiness)  | `503 Service Unavailable`   | `{"status":"busy","reason":"job_in_progress"}`                                                                                          |
+#### Response Contract
 
-### Standard Error Envelope
+| Scenario                  | HTTP Status                 | Response Body                                                                                                                                              |
+|---------------------------|-----------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Job accepted              | `202 Accepted`              | `{"job_id":"<uuidv4>","status":"accepted","message":"Job enqueued, processing in background"}`                                                             |
+| Job already running       | `409 Conflict`              | `{"code":"rate_limit","message":"A job is already in progress","correlation_id":"<uuidv4>","job_id":"<active_job_id>","hint":"Retry after the current job completes"}` |
+| Validation failure        | `400 Bad Request`           | `{"code":"validation","message":"<field-level detail>","correlation_id":"<uuidv4>"}`                                                                       |
+| Unexpected error          | `500 Internal Server Error` | `{"code":"internal","message":"Unexpected error","correlation_id":"<uuidv4>"}`                                                                             |
+| Output file exists        | `409 Conflict`              | `{"code":"duplicated_file","message":"<output_file> already exists, include overwrite: true","correlation_id":"<uuidv4>"}`                                 |
+| No matching input files   | `404 Not Found`             | `{"code":"no_input","message":"No PlanDePag*.pdf files found in INPUT_DIR","correlation_id":"<uuidv4>"}`                                                   |
+| Body exceeds 2KB          | `413 Request Entity Too Large` | `{"code":"request_too_large","message":"Request body exceeds 2KB limit","correlation_id":"<uuidv4>"}`                                                   |
+| Wrong Content-Type        | `415 Unsupported Media Type`| `{"code":"unsupported_media_type","message":"Content-Type must be application/json","correlation_id":"<uuidv4>"}`                                          |
+| Job running               | `200 OK`                    | `{"job_id":"<uuidv4>","status":"running"}`                                                                                                                 |
+| Job finished              | `200 OK`                    | `{"job_id":"<uuidv4>","status":"finished"}`                                                                                                                |
+| Job failed                | `200 OK`                    | `{"job_id":"<uuidv4>","status":"failed","reason":"<description>"}`                                                                                         |
+| Job not found             | `404 Not Found`             | `{"code":"not_found","message":"No job with id <id>","correlation_id":"<uuidv4>"}`                                                                         |
 
-Every non-2xx response must use this envelope:
+> **`no_input` and `duplicated_file` checks are synchronous.** Both are evaluated before the job is accepted and before `202` is returned. If either condition is met, no `job_id` is created.
+
+Standard non-2xx envelope:
 
 ```json
 {
-  "code":           "rate_limit | validation | auth | csv_write | internal",
-  "message":        "<human-readable description>",
+  "code": "rate_limit | validation | duplicated_file | no_input | request_too_large | unsupported_media_type | csv_write | internal | not_found",
+  "message": "<human-readable description>",
   "correlation_id": "<uuidv4>",
-  "hint":           "<optional — required for 409 and 403>"
+  "hint": "<optional; required for 409 rate_limit, recommended for validation>"
 }
 ```
 
-Retry guidance per code: `rate_limit` → retry after job completes; `validation` → fix payload and resubmit; `auth` → verify token; `internal` → contact ops with `correlation_id`.
+Concurrency/rate-limit behavior:
+
+- Only one active job at a time (active = `accepted` or `running`).
+- If active job exists: fail fast with `409`; do not queue.
+- If no active job: mark accepted, return quickly (target <=3s), process in background.
+- Rate limiter and tracker must be goroutine-safe and non-blocking for server main loop.
+
+Job lifecycle and runtime controls:
+
+- States: `accepted -> running -> finished|failed`.
+- Job metadata persisted in memory for the last `JOB_HISTORY_MAX` completed jobs (default `100`); older entries are evicted FIFO. Active and accepted jobs are never evicted.
+- `correlation_id` / `job_id` generated as UUIDv4 at acceptance and propagated via context.
+- Recover panic in background workers; log at `ERROR` and mark job `failed`.
+- Apply `JOB_MAX_DURATION` timeout (default `1m`) to cancel long-running jobs.
+
+Graceful shutdown:
+
+1. Stop accepting new requests on `SIGTERM`/`SIGINT`.
+2. Drain active job for up to `SHUTDOWN_TIMEOUT` (default `30s`).
+3. Cancel active job after timeout, log partial state at `WARN`, run cleanup sweep (delete `.tmp` files).
+
+Configuration precedence and validation:
+
+- Precedence: environment variables override defaults.
+- Required startup validation rejects invalid values (for example invalid `PORT`, invalid `LOG_LEVEL`, out-of-range workers, non-existent `INPUT_DIR`). Any validation failure logs to stderr at `ERROR` and exits with code `1`.
+
+Primary env vars:
+
+- `PORT` (default `8080`)
+- `PREFIX_PATH` (default `/api/pdf-converter`)
+- `INPUT_DIR` (default `.`; must exist at startup)
+- `SHUTDOWN_TIMEOUT` (default `30s`)
+- `CSV_DEFAULT_OUTPUT` (default `output.csv`)
+- `JOB_MAX_DURATION` (default `1m`)
+- `WORKERS_DEFAULT` (default `min(NumCPU, 16)`, bounded by `[1,16]`)
+- `LOG_LEVEL` (default `info`)
+- `JOB_HISTORY_MAX` (default `100`; minimum `1`)
 
 ---
 
-## 11. Concurrency & Rate Limiting (API)
+## 3. Restrictions
 
-- Only **one active job** is allowed at any time. Enforced in the API layer via the `RateLimiter` port.
-- When `POST /read-all` arrives: check job state atomically.
-  - Job running → respond immediately with `409`. Do **not** queue.
-  - No job running → set state `Accepted`, respond `202` within ≤3s, continue processing in background goroutine.
-- The rate limiter must **not block the main goroutine**. All state checks and updates must be goroutine-safe (atomic ops or mutex-protected).
-- The CSV writer mutex (Section 5) applies equally to API-triggered jobs.
+### * Testing & Quality Gates
 
----
+| Test Type            | Scope                                                    | Requirement                                                                  |
+|----------------------|----------------------------------------------------------|------------------------------------------------------------------------------|
+| Unit tests           | `service`, parsing, transforms, infrastructure adapters  | Coverage >=95% on internal packages                                          |
+| Contract tests       | `CSVWriter`, `RateLimiter`, `JobTracker`, `PDFExtractor` | Must verify interface behavior and expected errors                           |
+| Race tests           | Full repository                                          | `go test -race ./...` with zero races                                        |
+| Stress tests         | API rate limiter                                         | N concurrent `POST /read-all`: exactly one `202`, rest `409`                 |
+| Failure injection    | CSV errors, timeout, panic recovery, cleanup, rename fail | Verify envelope/logging correctness and `.tmp` cleanup execution            |
+| Integration tests    | Fixture PDF set                                          | Successful run yields CSV with header + >=72 data rows                       |
+| CSV parse validation | Integration output                                       | Parse output via Go `encoding/csv` with zero parse errors                    |
+| Row ordering test    | Integration output with multiple fixture PDFs            | CSV rows must match expected alphabetical file order and intra-file row order |
 
-## 12. Background Job Lifecycle
+Mandatory CI gates:
 
-| State | Meaning | Transitions To |
-|---|---|---|
-| `Accepted` | Request validated, `correlation_id` assigned, processing not yet started | `Running` |
-| `Running` | PDF extraction and CSV write in progress | `Finished` \| `Failed` |
-| `Finished` | All PDFs processed; CSV written successfully | — (terminal) |
-| `Failed` | Unrecoverable error; partial output may exist | — (terminal) |
+- `go build ./...`
+- `go vet ./...`
+- `go test -race ./...`
+- `gosec ./...` (project-level `.gosec` suppression file required; all suppressions must include a justification comment)
+- Internal package coverage threshold >=95%
 
-- Job state is persisted **in memory** (minimum) for the lifetime of the process.
-- Each job has a **UUIDv4** `correlation_id` generated at acceptance time and propagated through all layers via context.
-- Terminal state transitions must be emitted as a structured log entry (`INFO`) and increment the relevant metric.
-- Background goroutines must use `defer` and context cancellation to guarantee file handles, mutexes, and temp resources are always released — including on panic.
-- Panics inside background goroutines must be **recovered**, logged at `ERROR`, and set job state to `Failed`.
+> **Testing Coverage:** The minimum accepted coverage is 95% on internal packages, with mandatory race and failure-path validation.
 
-### Graceful Shutdown
+### * Test Fixtures
 
-On `SIGTERM` or `SIGINT`:
+- Use synthetic/anonymized PDFs or mocks for `PDFExtractor`; never include production data.
+- Integration tests must use the agreed reference fixture set.
+- Manual verification against Google Sheets is required on the reference fixture set before first release.
 
-1. Stop accepting new requests immediately.
-2. Wait up to `SHUTDOWN_TIMEOUT` (default: `30s`, configurable) for the active job to complete.
-3. If the job exceeds the timeout: cancel via context, log the partial state at `WARN`, run the cleanup sweep.
-4. Exit with the appropriate exit code (see Section 17).
-5. Store a checkpoint for a recoverable job state in a file `checkpoint_<yyyymmddhhmiss> for allowing resumption on restart (v2 enhancement).
+### * Out of Scope
 
----
+- Password-protected PDFs.
+- Download endpoint (files are supplied through input directory only).
+- Authentication, bearer-token validation, RBAC, and mTLS (fully deferred to a future version).
+- Recursive directory search.
+- Data extraction outside payment-plan table.
+- Export formats other than CSV.
+- Multi-replica/distributed locking.
+- Automatic retry of failed PDFs.
+- Completion webhook/polling beyond explicit job status endpoint.
+- Reintroduction of deprecated `Row Number` column.
+- Per-file size limits (deferred; no `MAX_PDF_SIZE_MB` in V3).
 
-## 13. Configuration
-
-### Source & Precedence
-
-```
-Environment variables  >  YAML config file (path from CONFIG_FILE)  >  hardcoded defaults
-```
-
-| Env Var | Default | Description |
-|---|---|---|
-| `PORT` | `8080` | HTTP server port |
-| `PREFIX_PATH` | `/api/pdf-converter` | Route prefix for all API endpoints |
-| `INPUT_DIR` | . | Input dir  |
-| `RATE_LIMIT_TIMEOUT` | `3s` | Max time to hold connection before responding while job starts in background |
-| `SHUTDOWN_TIMEOUT` | `30s` | Max drain time on `SIGTERM` before force-cancelling the active job |
-| `CSV_DEFAULT_OUTPUT` | `output.csv` | Default output CSV path when not specified in the request |
-| `JOB_MAX_DURATION` | `1m` | Max wall-clock time for a background job before context cancellation |
-| `WORKERS_DEFAULT` | `NumCPU` | Default worker goroutine count when not specified in the request |
-| `LOG_LEVEL` | `info` | Enum: `debug`, `info`, `warn`, `error` |
-| `CONFIG_FILE` | *(unset)* | Optional path to YAML config file for overrides |
-
-Startup validation must **reject the process** with a clear, actionable error if any required variable is missing or any value fails its constraint (e.g., `PORT` not a valid integer, `LOG_LEVEL` not in enum, `WORKERS_DEFAULT` out of range).
+Undefined behavior remains out of scope until explicitly approved through change management.
 
 ---
 
-## 14. Security
+## 4. Definition of Done
 
-### Input Sanitization
+- `POST $PREFIX_PATH/read-all` validates schema and returns `202` in <=3 seconds when accepted.
+- Exactly one active job is enforced with fast-fail `409` for concurrent submissions.
+- `overwrite` and `no_input` checks happen synchronously before `202` is returned.
+- CSV writing is thread-safe via mutex-protected adapter.
+- CSV row order is deterministic (alphabetical file order, then intra-file row order) regardless of worker concurrency.
+- All non-2xx responses follow the standard error envelope with `correlation_id`.
+- `job_id` and `correlation_id` are the same UUIDv4, consistently used across response body and logs.
+- Integration run on reference fixtures generates output with header + >=72 rows.
+- Failures are always surfaced with specific reasons in envelope and/or failures log.
+- `.tmp` artifacts are cleaned on success, failure, panic, timeout, and shutdown; startup performs a cleanup sweep.
+- Existing output handling follows overwrite policy (`409` when `overwrite=false`, atomic replace when `true`).
+- Successfully parsed `PlanDePag*.pdf` files are renamed to `Done-PlanDePag*.pdf`; rename failures are logged as `FILE_ERROR` without removing already-written rows.
+- Job history is capped at `JOB_HISTORY_MAX` completed entries with FIFO eviction.
+- README documents build instructions (`darwin/arm64`, `linux/amd64`), library justification, architecture Mermaid diagram, regex modification guide, and `gosec` suppression policy.
+- CI gates (`build`, `vet`, `race`, `gosec`, coverage threshold) pass.
 
-- `INPUT_DIR` validated against `..` traversal patterns and validate that is a correct expression for a path.
-- `workers` validated as integer within `[1, 16]`.
-- `overwrite` validated strictly as boolean — non-boolean strings must return `400`.
-- Request body size limit: **2KB** maximum to prevent payload abuse.
+### Checklist
 
----
-
-## 15. Resource Cleanup
-
-- Track every temporary directory and file created during PDF parsing.
-- Delete temp resources on: job completion, job failure, and shutdown hooks.
-- On startup, **before accepting traffic**, run a cleanup sweep to remove orphaned artifacts from any previous crashed run.
-- Use `defer` + context cancellation to guarantee cleanup even on panic.
-- Emit metrics `temp_files_deleted_total` and `cleanup_errors_total` to detect leaks early.
-- Failure-injection tests must confirm cleanup executes on panic and timeout paths.
-
----
-
-## 16. Observability
-
-### Structured Logging
-
-- Use `log/slog` (stdlib). Level configurable via `LOG_LEVEL` env var.
-- Every log entry must carry: `correlation_id`, `layer` (`api` / `service` / `infra`), level.
-- Security events → `WARN`. Job state transitions → `INFO`. Cleanup events → `DEBUG`.
+- [ ] All acceptance criteria are met and verified.
+- [ ] Unit and integration tests pass with required coverage.
+- [ ] Out-of-scope items have not been implemented.
+- [ ] Documentation updated.
 
 ---
-
-## 17. Testing & Quality Gates
-
-| Test Type | Scope | Requirement |
-|---|---|---|
-| Unit tests | `service`, `infrastructure` parsing & transform packages | ≥95% coverage via `go test -coverprofile`.|
-| Contract tests | Each adapter (`CSVWriter`, `RateLimiter`, `JobTracker`, `PDFExtractor`) | Verify each adapter satisfies its port interface and returns correct types/errors. |
-| Race condition tests | All packages | `go test -race ./...` must pass with zero data race errors. |
-| Stress tests | Rate limiter | Send N concurrent `POST /read-all` requests; assert exactly 1 receives `202` and all others receive `409`. |
-| Failure injection | CSV write errors, job timeout, panic recovery, cleanup | Inject failures via mock adapters; assert correct error envelope is returned and all temp resources are cleaned. |
-
-### Test Fixtures
-
-- Tests in the parsing and transformation packages must use **real anonymized or synthetic PDF files**, or mocks of the `PDFExtractor` interface — **never hardcoded strings extracted from production PDFs**.
-- No production data of any kind may exist in the repository.
-- The integration test suite uses the **reference PDF fixture set**; the DoD assertion is `len(rows) >= 72` after a successful run.
-
-### CI Gates (all must pass before merge)
-
-```
-go build ./...
-go vet ./...
-go test -race ./...
-gosec ./...
-coverage threshold ≥95% on internal packages
-```
-
----
-
-## 19. README Requirements
-
-The README must document:
-
-1. **Compilation instructions** for both `darwin/arm64` and `linux/amd64`.
-2. **Environment variable reference** for the microservice (full table from Section 13).
-3. **PDF library justification** — which library was chosen and why (see Section 7).
-4. **How to modify regex patterns** — where the constants live, how to test a change, what to watch out for.
-
----
-
-## 20. Out of Scope (v1)
-
-- Password-protected PDFs
-- Bearer token management/rotation strategy (beyond validation in the API layer)
-- Recursive directory search (non-default; candidate for `--recursive` flag in v2)
-- Extraction of data outside the payment plan table (contract header, debtor details, etc.)
-- Export formats other than CSV
-- Multiple replicas / distributed locking
-- Automatic retry of failed PDFs
-- Role-based access control (any valid token = full access in v1)
-- mTLS (bearer token sufficient for v1)
-- Webhook or polling endpoint for job completion status
-
----
-
-## 22. Definition of Done
-
-1. `POST $PREFIX_PATH/read-all` accepts the schema in Section 4, enforces auth and validation, returns `202` within ≤3s.
-2. CSV writing is thread-safe (mutex-protected adapter). Rate limiter enforces single-job concurrency with fast-fail `409`.
-3. All response cases return the standardized error envelope (Section 10).
-4. Integration test against the reference PDF fixture set produces a CSV with header + **≥72 data rows**.
-5. Every failure cause surfaced via standardized envelope or `failures.log` entry with a **specific, non-generic reason**.
-6. Temp resources cleaned on success, failure, panic, and shutdown — confirmed by failure-injection tests.
-7. All CI gates pass: `build`, `vet`, `race`, `gosec`, ≥95% coverage on internal packages.
-8. README includes: build instructions, CLI examples, env var reference, PDF library justification, and regex modification guide.
-10. In the failure file should not be an invalid row by format. It should be analized in order to sanitize and include it
